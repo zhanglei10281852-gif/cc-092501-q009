@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.database import get_connection, transaction
+from app.hydro import comparison as comparison_engine
 
 
 SCHEMA = """
@@ -44,8 +45,17 @@ CREATE TABLE IF NOT EXISTS hydro_audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, resource_type TEXT NOT NULL, resource_id INTEGER,
  action TEXT NOT NULL, actor TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS hydro_comparison_reports (
+ id INTEGER PRIMARY KEY AUTOINCREMENT, report_key TEXT NOT NULL UNIQUE,
+ kind TEXT NOT NULL CHECK(kind IN ('inversion','transport')), dataset_id INTEGER NOT NULL,
+ baseline_task_id INTEGER NOT NULL, candidate_task_id INTEGER NOT NULL,
+ baseline_version TEXT NOT NULL, candidate_version TEXT NOT NULL,
+ options_json TEXT NOT NULL DEFAULT '{}', input_fingerprint TEXT NOT NULL,
+ report_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_hydro_samples_well ON hydro_samples(well_id,sampled_at);
 CREATE INDEX IF NOT EXISTS idx_hydro_inversions_status ON hydro_inversions(status,created_at);
+CREATE INDEX IF NOT EXISTS idx_hydro_comparisons_kind ON hydro_comparison_reports(kind,dataset_id,id);
 """
 
 
@@ -181,3 +191,206 @@ class HydroService:
         with transaction(immediate=True) as connection:
             cursor=connection.execute("INSERT INTO hydro_transport_runs(well_id,task_key,model_version,input_json,status,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(well_id,key,payload["model_version"],json.dumps(payload,ensure_ascii=False),"done",json.dumps(result,ensure_ascii=False),now,now))
             return dict(connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?",(cursor.lastrowid,)).fetchone())
+
+    # ------------------------------------------------------------------
+    # 模型版本结果比较
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_options(options: dict[str, Any] | None) -> dict[str, Any]:
+        """剔除空值并按键排序，保证语义相同的选项生成相同指纹。"""
+        normalized: dict[str, Any] = {}
+        for key in sorted(options or {}):
+            value = options[key]
+            if value is None:
+                continue
+            if key == "thresholds" and isinstance(value, dict):
+                value = {k: v for k, v in sorted(value.items()) if v is not None}
+            normalized[key] = value
+        return normalized
+
+    def _load_inversion_tasks(self, baseline_id: int, candidate_id: int) -> tuple[sqlite3.Row, sqlite3.Row]:
+        if baseline_id == candidate_id:
+            raise ValueError("cannot_compare_task_with_itself")
+        baseline = self.connection.execute("SELECT * FROM hydro_inversions WHERE id=?", (baseline_id,)).fetchone()
+        candidate = self.connection.execute("SELECT * FROM hydro_inversions WHERE id=?", (candidate_id,)).fetchone()
+        if baseline is None or candidate is None:
+            raise KeyError("inversion_not_found")
+        for task in (baseline, candidate):
+            if task["status"] != "done":
+                raise ValueError("inversion_not_done")
+        if baseline["sample_id"] != candidate["sample_id"]:
+            raise ValueError("datasets_do_not_match")
+        return baseline, candidate
+
+    def _load_transport_runs(self, baseline_id: int, candidate_id: int) -> tuple[sqlite3.Row, sqlite3.Row]:
+        if baseline_id == candidate_id:
+            raise ValueError("cannot_compare_task_with_itself")
+        baseline = self.connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?", (baseline_id,)).fetchone()
+        candidate = self.connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?", (candidate_id,)).fetchone()
+        if baseline is None or candidate is None:
+            raise KeyError("transport_not_found")
+        if baseline["well_id"] != candidate["well_id"]:
+            raise ValueError("datasets_do_not_match")
+        return baseline, candidate
+
+    def _save_or_get_report(
+        self,
+        *,
+        kind: str,
+        dataset_id: int,
+        baseline: sqlite3.Row,
+        candidate: sqlite3.Row,
+        options: dict[str, Any],
+        report_body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """按 (任务对, 选项) 复用报告；保存输入指纹与生成时间。"""
+        report_key = _digest(
+            {
+                "kind": kind,
+                "baseline_task_id": baseline["id"],
+                "candidate_task_id": candidate["id"],
+                "options": options,
+            }
+        )
+        existing = self.connection.execute(
+            "SELECT * FROM hydro_comparison_reports WHERE report_key=?", (report_key,)
+        ).fetchone()
+        if existing is not None:
+            return self._report_record(dict(existing))
+
+        fingerprint = _digest(
+            {
+                "kind": kind,
+                "baseline": {
+                    "task_key": baseline["task_key"],
+                    "input": json.loads(baseline["input_json"]),
+                    "result": json.loads(baseline["result_json"]),
+                },
+                "candidate": {
+                    "task_key": candidate["task_key"],
+                    "input": json.loads(candidate["input_json"]),
+                    "result": json.loads(candidate["result_json"]),
+                },
+                "options": options,
+            }
+        )
+        now = _now()
+        envelope = {
+            "kind": kind,
+            "dataset_id": dataset_id,
+            "baseline": {"task_id": baseline["id"], "model_version": baseline["model_version"]},
+            "candidate": {"task_id": candidate["id"], "model_version": candidate["model_version"]},
+            "options": options,
+            "input_fingerprint": fingerprint,
+            "created_at": now,
+            **report_body,
+        }
+        with transaction(immediate=True) as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO hydro_comparison_reports(report_key,kind,dataset_id,baseline_task_id,candidate_task_id,baseline_version,candidate_version,options_json,input_fingerprint,report_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (report_key, kind, dataset_id, baseline["id"], candidate["id"], baseline["model_version"], candidate["model_version"], json.dumps(options, ensure_ascii=False), fingerprint, json.dumps(envelope, ensure_ascii=False), now),
+            )
+        row = self.connection.execute(
+            "SELECT * FROM hydro_comparison_reports WHERE report_key=?", (report_key,)
+        ).fetchone()
+        return self._report_record(dict(row))
+
+    @staticmethod
+    def _report_record(row: dict[str, Any]) -> dict[str, Any]:
+        report = json.loads(row["report_json"])
+        report["id"] = row["id"]
+        return report
+
+    def compare_inversions(self, baseline_id: int, candidate_id: int, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        options = self._normalize_options(options)
+        baseline, candidate = self._load_inversion_tasks(baseline_id, candidate_id)
+        body = comparison_engine.compare_inversion(
+            json.loads(baseline["input_json"]),
+            json.loads(baseline["result_json"]),
+            json.loads(candidate["input_json"]),
+            json.loads(candidate["result_json"]),
+            options,
+        )
+        return self._save_or_get_report(
+            kind="inversion",
+            dataset_id=baseline["sample_id"],
+            baseline=baseline,
+            candidate=candidate,
+            options=options,
+            report_body=body,
+        )
+
+    def compare_transport_runs(self, baseline_id: int, candidate_id: int, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        options = self._normalize_options(options)
+        baseline, candidate = self._load_transport_runs(baseline_id, candidate_id)
+        body = comparison_engine.compare_transport(
+            json.loads(baseline["input_json"]),
+            json.loads(baseline["result_json"]),
+            json.loads(candidate["input_json"]),
+            json.loads(candidate["result_json"]),
+            options,
+        )
+        return self._save_or_get_report(
+            kind="transport",
+            dataset_id=baseline["well_id"],
+            baseline=baseline,
+            candidate=candidate,
+            options=options,
+            report_body=body,
+        )
+
+    def get_comparison(self, report_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM hydro_comparison_reports WHERE id=?", (report_id,)).fetchone()
+        return self._report_record(dict(row)) if row is not None else None
+
+    @staticmethod
+    def _summary(report_id: int, row: sqlite3.Row) -> dict[str, Any]:
+        """列表项只返回摘要，不携带曲线明细等大字段。"""
+        report = json.loads(row["report_json"])
+        summary = report.get("summary", {})
+        return {
+            "id": report_id,
+            "kind": row["kind"],
+            "dataset_id": row["dataset_id"],
+            "baseline": {"task_id": row["baseline_task_id"], "model_version": row["baseline_version"]},
+            "candidate": {"task_id": row["candidate_task_id"], "model_version": row["candidate_version"]},
+            "comparability": report.get("comparability"),
+            "input_fingerprint": row["input_fingerprint"],
+            "created_at": row["created_at"],
+            "metric_count": summary.get("metric_count"),
+            "comparable_count": summary.get("comparable_count"),
+            "incomparable_count": len(report.get("incomparable", [])),
+            "largest_change": summary.get("largest_change"),
+            "threshold_crossings": summary.get("threshold_crossings", []),
+        }
+
+    def list_comparisons(
+        self,
+        *,
+        kind: str | None = None,
+        dataset_id: int | None = None,
+        offset: int = 0,
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """稳定排序（kind、dataset_id、id 均升序）的报告摘要分页结果。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if kind:
+            clauses.append("kind=?")
+            params.append(kind)
+        if dataset_id is not None:
+            clauses.append("dataset_id=?")
+            params.append(dataset_id)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        total = self.connection.execute(f"SELECT COUNT(*) AS n FROM hydro_comparison_reports{where}", params).fetchone()["n"]
+        rows = self.connection.execute(
+            f"SELECT * FROM hydro_comparison_reports{where} ORDER BY kind ASC,dataset_id ASC,id ASC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "data": [self._summary(row["id"], row) for row in rows],
+        }

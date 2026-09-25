@@ -54,3 +54,28 @@ class TransportRequest(BaseModel):
     step_days: float = Field(default=1, gt=0, le=1000)
     model_version: str = Field(default="ade-1", min_length=1, max_length=40)
 
+
+class ComparisonThresholds(BaseModel):
+    # 反演拟合残差上限（归一化 rmse）。
+    rmse_max: float | None = Field(default=None, gt=0)
+    # 污染浓度关键阈值，用于峰值越界与首次超标时间比较。
+    concentration_limit: float | None = Field(default=None, ge=0)
+    # 污染到达时间上限（天）。
+    arrival_time_max: float | None = Field(default=None, gt=0)
+
+
+class ComparisonRequest(BaseModel):
+    baseline_task_id: int = Field(..., gt=0)
+    candidate_task_id: int = Field(..., gt=0)
+    uncertainty_band: float | None = Field(default=None, gt=0, le=10)
+    align_step_days: float | None = Field(default=None, gt=0, le=10000)
+    thresholds: ComparisonThresholds | None = None
+
+    def options(self) -> dict:
+        data = self.model_dump(exclude={"baseline_task_id", "candidate_task_id"}, exclude_none=True)
+        if "thresholds" in data:
+            data["thresholds"] = {k: v for k, v in data["thresholds"].items() if v is not None}
+            if not data["thresholds"]:
+                del data["thresholds"]
+        return data
+
