@@ -54,3 +54,16 @@ class TransportRequest(BaseModel):
     step_days: float = Field(default=1, gt=0, le=1000)
     model_version: str = Field(default="ade-1", min_length=1, max_length=40)
 
+
+class ComparisonThresholds(BaseModel):
+    concentration: float | None = Field(default=None, ge=0, le=1000000)
+    arrival_time_days: float | None = Field(default=None, ge=0, le=100000)
+    fraction_shift: float = Field(default=0.1, ge=0, le=1)
+
+
+class ComparisonRequest(BaseModel):
+    comparison_type: str = Field(..., pattern="^(inversion|transport)$")
+    baseline_id: int = Field(..., ge=1)
+    candidate_id: int = Field(..., ge=1)
+    thresholds: ComparisonThresholds = Field(default_factory=ComparisonThresholds)
+

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.hydro.schemas import EndmemberCreate, InversionRequest, SampleCreate, TransportRequest, WellCreate
+from app.hydro.schemas import ComparisonRequest, EndmemberCreate, InversionRequest, SampleCreate, TransportRequest, WellCreate
 from app.hydro.service import HydroService
 
 router=APIRouter(prefix="/api/hydro",tags=["地下水科学计算"])
@@ -51,3 +51,19 @@ def run_inversion(task_id:int,worker_id:str=Query(...,min_length=1)):
 def run_transport(well_id:int,payload:TransportRequest):
     try: return service().run_transport(well_id,payload.model_dump())
     except KeyError as exc: raise HTTPException(404,"井点不存在") from exc
+
+@router.post("/comparisons",status_code=201)
+def create_comparison(payload:ComparisonRequest):
+    try: return service().create_comparison(payload.model_dump())
+    except KeyError as exc: raise HTTPException(404,"比较对象不存在") from exc
+    except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+
+@router.get("/comparisons")
+def list_comparisons(comparison_type:str|None=Query(default=None,pattern="^(inversion|transport)$")):
+    return {"items":service().list_comparisons(comparison_type)}
+
+@router.get("/comparisons/{comparison_id}")
+def get_comparison(comparison_id:int):
+    value=service().get_comparison(comparison_id)
+    if value is None: raise HTTPException(404,"比较报告不存在")
+    return value
